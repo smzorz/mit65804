@@ -164,6 +164,7 @@ func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
 	}
 	return nil
 }
+
 func (c *Coordinator) timeChecker() {
 	for {
 		time.Sleep(1 * time.Second)
