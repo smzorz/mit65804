@@ -13,8 +13,6 @@ import (
 type TaskState int
 type TaskType int
 
-var lock sync.Mutex
-
 const (
 	Idle TaskState = iota
 	InProgress
@@ -47,6 +45,7 @@ type Coordinator struct {
 	nReduce  int
 	State    TaskType
 	Mapcount int
+	Lock     sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -64,8 +63,8 @@ func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
 		reply.Filename = ""
 		return nil
 	} else if c.State == Mapping {
-		lock.Lock()
-		defer lock.Unlock()
+		c.Lock.Lock()
+		defer c.Lock.Unlock()
 		count := 0
 		for _, task := range c.Tasks {
 			if task.state == Completed {
@@ -111,8 +110,8 @@ func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
 
 		}
 	} else if c.State == Reducing {
-		lock.Lock()
-		defer lock.Unlock()
+		c.Lock.Lock()
+		defer c.Lock.Unlock()
 		count := 0
 		for _, task := range c.Tasks {
 			if task.state == Completed {
@@ -149,12 +148,12 @@ func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
 }
 
 func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
-	lock.Lock()
-	defer lock.Unlock()
+	c.Lock.Lock()
+	defer c.Lock.Unlock()
 	for i := range c.Tasks {
 		if c.Tasks[i].taskID == args.TaskID && c.Tasks[i].Type == args.Type {
 			c.Tasks[i].state = Completed
-			break
+			c.Done()
 		}
 	}
 	return nil
@@ -162,13 +161,13 @@ func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
 func (c *Coordinator) timeChecker() {
 	for {
 		time.Sleep(1 * time.Second)
-		lock.Lock()
+		c.Lock.Lock()
 		for _, task := range c.Tasks {
 			if task.state == InProgress && time.Since(task.StartTime) > 10*time.Second {
 				task.state = Idle
 			}
 		}
-		lock.Unlock()
+		c.Lock.Unlock()
 	}
 }
 
@@ -192,7 +191,9 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-
+	if c.State == AllDone {
+		ret = true
+	}
 	return ret
 }
 
@@ -214,7 +215,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		c.Tasks = append(c.Tasks, task)
 	}
 	c.Mapcount = len(files)
-
+	c.Lock = sync.Mutex{}
 	// Your code here.
 	go c.timeChecker()
 	c.server()

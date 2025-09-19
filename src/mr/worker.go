@@ -46,123 +46,145 @@ func Worker(mapf func(string, string) []KeyValue,
 			fmt.Printf("register success %v\n", reply.Filename)
 		} else {
 			fmt.Printf("register failed!\n")
+			break // coordinator exited
 		}
 		if reply.Filename == "" {
-			return
+			break // all done
 		}
-		if reply.Type == MapTask {
-			var encoders = make([]*json.Encoder, reply.NReduce)
-			var tempfilenames = make([]string, reply.NReduce)
-			for i := 0; i < reply.NReduce; i++ {
-				//var filename = "mr-" + strconv.Itoa(reply.TaskID) + "-" + strconv.Itoa(i) + ".json"
-				tempFile, err := os.CreateTemp("", "mr-tmp-*")
-				tempfilenames[i] = tempFile.Name()
+		switch reply.Type {
+		case MapTask:
+			{
+				var encoders = make([]*json.Encoder, reply.NReduce)
+				var tempfilenames = make([]string, reply.NReduce)
+				var tempFiles = make([]*os.File, reply.NReduce)
+				//创建nReduce个临时文件和对应的json编码器
+				for i := 0; i < reply.NReduce; i++ {
+					//var filename = "mr-" + strconv.Itoa(reply.TaskID) + "-" + strconv.Itoa(i) + ".json"
+					tempFile, err := os.CreateTemp("", "mr-tmp-*")
+					tempFiles[i] = tempFile
+					tempfilenames[i] = tempFile.Name()
+					if err != nil {
+						log.Fatalf("cannot create temp file")
+					}
+
+					encoders[i] = json.NewEncoder(tempFile)
+				}
+
+				//执行map任务
+				file, err := os.Open(reply.Filename)
+				if err != nil {
+					log.Fatalf("cannot open %v", reply.Filename)
+				}
+				content, err := ioutil.ReadAll(file)
+				if err != nil {
+					log.Fatalf("cannot read %v", reply.Filename)
+				}
+				file.Close()
+				kva := mapf(reply.Filename, string(content))
+				for _, kv := range kva {
+					var reduceNumber = ihash(kv.Key) % reply.NReduce
+					err := encoders[reduceNumber].Encode(&kv)
+					if err != nil {
+						log.Fatalf("cannot write %v", reply.Filename)
+					}
+				}
+				//关闭临时文件
+				for _, file := range tempFiles {
+					file.Close()
+				}
+				//将临时文件改名为正式文件
+				//防止worker在写文件过程中crash导致中间文件不完整
+				for i := 0; i < reply.NReduce; i++ {
+					oname := "mr-" + strconv.Itoa(reply.TaskID) + "-" + strconv.Itoa(i) + ".json"
+					err := os.Rename(tempfilenames[i], oname)
+					if err != nil {
+						log.Fatalf("cannot rename %v to %v", tempfilenames[i], oname)
+					}
+				}
+				argsReport := ReportArgs{
+					TaskID: reply.TaskID,
+					Type:   MapTask,
+				}
+				replyReport := ReportReply{}
+				ok = call("Coordinator.Report", &argsReport, &replyReport)
+				if ok {
+					fmt.Printf("report success %v\n", reply.Filename)
+				} else {
+					fmt.Printf("report failed!\n")
+				}
+			}
+
+		case ReduceTask:
+			{
+				tempFile, err := os.CreateTemp("", "mr-out-tmp-*")
 				if err != nil {
 					log.Fatalf("cannot create temp file")
 				}
-				defer tempFile.Close()
+				tempFilename := tempFile.Name()
 
-				encoders[i] = json.NewEncoder(tempFile)
-			}
+				//oname := "mr-out-" + strconv.Itoa(reply.TaskID)
+				//var decoders = make([]*json.Decoder, reply.NReduce)
+				files := findIntermediateFilesForReduce(reply.TaskID, reply.Mapcount)
 
-			//执行map任务
-			file, err := os.Open(reply.Filename)
-			if err != nil {
-				log.Fatalf("cannot open %v", reply.Filename)
-			}
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("cannot read %v", reply.Filename)
-			}
-			file.Close()
-			kva := mapf(reply.Filename, string(content))
-			for _, kv := range kva {
-				var reduceNumber = ihash(kv.Key) % reply.NReduce
-				err := encoders[reduceNumber].Encode(&kv)
-				if err != nil {
-					log.Fatalf("cannot write %v", reply.Filename)
-				}
-			}
-			for i := 0; i < reply.NReduce; i++ {
-				oname := "mr-" + strconv.Itoa(reply.TaskID) + "-" + strconv.Itoa(i) + ".json"
-				err := os.Rename(tempfilenames[i], oname)
-				if err != nil {
-					log.Fatalf("cannot rename %v to %v", tempfilenames[i], oname)
-				}
-			}
-			argsReport := ReportArgs{
-				TaskID: reply.TaskID,
-				Type:   MapTask,
-			}
-			replyReport := ReportReply{}
-			ok = call("Coordinator.Report", &argsReport, &replyReport)
-			if ok {
-				fmt.Printf("report success %v\n", reply.Filename)
-			} else {
-				fmt.Printf("report failed!\n")
-			}
-		}
-		time.Sleep(time.Second) //避免过于频繁的请求
-		if reply.Type == ReduceTask {
-			oname := "mr-out-" + strconv.Itoa(reply.TaskID)
-			var decoders = make([]*json.Decoder, reply.NReduce)
-			files := findIntermediateFilesForReduce(reply.TaskID, reply.Mapcount)
-			for i := 0; i < reply.Mapcount; i++ {
-				file, err := os.Open(files[i])
-				if err != nil {
-					log.Fatalf("cannot open %v", files[i])
-				}
-				defer file.Close()
-				decoders[i] = json.NewDecoder(file)
-			}
-			ofile, _ := os.Create(oname)
-			kva := []KeyValue{}
-			for i := 0; i < reply.Mapcount; i++ {
-				for {
-					var kv KeyValue
-					if err := decoders[i].Decode(&kv); err != nil {
-						break
+				kva := []KeyValue{}
+				for _, filename := range files {
+					file, err := os.Open(filename)
+					if err != nil {
+						log.Fatalf("cannot open %v", filename)
 					}
-					kva = append(kva, kv)
+
+					decoder := json.NewDecoder(file)
+					for {
+						var kv KeyValue
+						if err := decoder.Decode(&kv); err != nil {
+							break
+						}
+						kva = append(kva, kv)
+					}
+					file.Close()
+				}
+
+				//排序
+				sort.Sort(ByKey(kva))
+				i := 0
+				for i < len(kva) {
+					j := i + 1
+					for j < len(kva) && kva[j].Key == kva[i].Key {
+						j++
+					}
+					values := []string{}
+					for k := i; k < j; k++ {
+						values = append(values, kva[k].Value)
+					}
+					output := reducef(kva[i].Key, values)
+
+					// this is the correct format for each line of Reduce output.
+					fmt.Fprintf(tempFile, "%v %v\n", kva[i].Key, output)
+
+					i = j
+				}
+
+				tempFile.Close()
+				oname := "mr-out-" + strconv.Itoa(reply.TaskID)
+				err = os.Rename(tempFilename, oname)
+				if err != nil {
+					log.Fatalf("cannot rename %v to %v", tempFilename, oname)
+				}
+				argsReport := ReportArgs{
+					TaskID: reply.TaskID,
+					Type:   ReduceTask,
+				}
+				replyReport := ReportReply{}
+				ok = call("Coordinator.Report", &argsReport, &replyReport)
+				if ok {
+					fmt.Printf("report success %v\n", oname)
+				} else {
+					fmt.Printf("report failed!\n")
 				}
 			}
-			//排序
-			sort.Sort(ByKey(kva))
-			i := 0
-			for i < len(kva) {
-				j := i + 1
-				for j < len(kva) && kva[j].Key == kva[i].Key {
-					j++
-				}
-				values := []string{}
-				for k := i; k < j; k++ {
-					values = append(values, kva[k].Value)
-				}
-				output := reducef(kva[i].Key, values)
 
-				// this is the correct format for each line of Reduce output.
-				fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
-
-				i = j
-			}
-
-			ofile.Close()
-			argsReport := ReportArgs{
-				TaskID: reply.TaskID,
-				Type:   ReduceTask,
-			}
-			replyReport := ReportReply{}
-			ok = call("Coordinator.Report", &argsReport, &replyReport)
-			if ok {
-				fmt.Printf("report success %v\n", oname)
-			} else {
-				fmt.Printf("report failed!\n")
-			}
 		}
-		// Your worker implementation here.
-
-		// uncomment to send the Example RPC to the coordinator.
-		// CallExample()
+		time.Sleep(time.Second)
 	}
 }
 
