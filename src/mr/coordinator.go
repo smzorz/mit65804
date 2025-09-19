@@ -12,6 +12,7 @@ import (
 
 type TaskState int
 type TaskType int
+type CoordinatorState int
 
 const (
 	Idle TaskState = iota
@@ -24,7 +25,7 @@ const (
 	ReduceTask
 )
 const (
-	Mapping TaskType = iota
+	Mapping CoordinatorState = iota
 	Reducing
 	AllDone
 )
@@ -41,11 +42,12 @@ type Task struct {
 
 type Coordinator struct {
 	// Your definitions here.
-	Tasks    []Task
-	nReduce  int
-	State    TaskType
-	Mapcount int
-	Lock     sync.Mutex
+	MapTasks    []Task
+	nReduce     int
+	State       CoordinatorState
+	ReduceTasks []Task
+	Mapcount    int
+	Lock        sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -59,101 +61,105 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
-	if c.State == AllDone {
-		reply.Filename = ""
-		return nil
-	} else if c.State == Mapping {
-		c.Lock.Lock()
-		defer c.Lock.Unlock()
-		count := 0
-		for _, task := range c.Tasks {
-			if task.state == Completed {
-				count++
-			}
+	switch c.State {
+	case AllDone:
+		{
+			reply.Filename = ""
+			return nil
 		}
-		if count == len(c.Tasks) {
-			//所有map任务完成，进入reduce阶段
+	case Mapping:
+		{
+			c.Lock.Lock()
+			defer c.Lock.Unlock()
+			for i := range c.MapTasks {
+				if c.MapTasks[i].state == Idle {
+					c.MapTasks[i].state = InProgress
+					c.MapTasks[i].StartTime = time.Now()
+					reply.Filename = c.MapTasks[i].filename
+					reply.NReduce = c.nReduce
+					reply.TaskID = c.MapTasks[i].taskID
+					reply.Type = MapTask
+					reply.Mapcount = c.Mapcount
+					reply.Success = true
+					return nil
 
-			c.State = Reducing
-			//初始化reduce任务
-			c.Tasks = []Task{}
-			for i := 0; i < c.nReduce; i++ {
-				task := Task{
-					state:  Idle,
-					taskID: i,
-					Type:   ReduceTask,
 				}
-				c.Tasks = append(c.Tasks, task)
+
 			}
-			reply.Filename = ""
-			reply.NReduce = c.nReduce
-			reply.TaskID = 0
-			reply.Type = ReduceTask
-			reply.Mapcount = c.Mapcount
-			c.Tasks[0].state = InProgress
-			c.Tasks[0].StartTime = time.Now()
+			//没有空闲任务，返回空任务
+			reply.Success = false
 			return nil
 		}
+	case Reducing:
+		{
+			c.Lock.Lock()
+			defer c.Lock.Unlock()
+			for i := range c.ReduceTasks {
+				if c.ReduceTasks[i].state == Idle {
+					c.ReduceTasks[i].state = InProgress
+					c.ReduceTasks[i].StartTime = time.Now()
+					reply.Filename = "" //reduce任务不需要文件名
+					reply.NReduce = c.nReduce
+					reply.TaskID = c.ReduceTasks[i].taskID
+					reply.Type = ReduceTask
+					reply.Mapcount = c.Mapcount
+					reply.Success = true
+					return nil
 
-		//分配map任务
-		for i := range c.Tasks {
-			if c.Tasks[i].state == Idle {
-				c.Tasks[i].state = InProgress
-				c.Tasks[i].StartTime = time.Now()
-				reply.Filename = c.Tasks[i].filename
-				reply.NReduce = c.nReduce
-				reply.TaskID = c.Tasks[i].taskID
-				reply.Type = MapTask
-				return nil
+				}
 
 			}
-
-		}
-	} else if c.State == Reducing {
-		c.Lock.Lock()
-		defer c.Lock.Unlock()
-		count := 0
-		for _, task := range c.Tasks {
-			if task.state == Completed {
-				count++
-			}
-		}
-		if count == len(c.Tasks) {
-			//所有reduce任务完成，进入done状态
-			c.State = AllDone
-			reply.Filename = ""
+			//没有空闲任务，返回空任务
+			reply.Success = false
 			return nil
 		}
-
-		//分配reduce任务
-		for i := range c.Tasks {
-			if c.Tasks[i].state == Idle {
-				c.Tasks[i].state = InProgress
-				c.Tasks[i].StartTime = time.Now()
-				reply.Filename = "" //reduce任务不需要文件名
-				reply.NReduce = c.nReduce
-				reply.TaskID = c.Tasks[i].taskID
-				reply.Type = ReduceTask
-				reply.Mapcount = c.Mapcount
-				return nil
-
-			}
-
-		}
-
 	}
-
 	return nil
-
 }
 
 func (c *Coordinator) Report(args *ReportArgs, reply *ReportReply) error {
 	c.Lock.Lock()
 	defer c.Lock.Unlock()
-	for i := range c.Tasks {
-		if c.Tasks[i].taskID == args.TaskID && c.Tasks[i].Type == args.Type {
-			c.Tasks[i].state = Completed
-			c.Done()
+	switch args.Type {
+	case MapTask:
+		{
+			for i := range c.MapTasks {
+				if c.MapTasks[i].taskID == args.TaskID && c.MapTasks[i].Type == MapTask {
+					c.MapTasks[i].state = Completed
+					break
+				}
+			}
+			//检查是否所有map任务完成，若完成则进入reducing阶段
+			allDone := true
+			for i := range c.MapTasks {
+				if c.MapTasks[i].state != Completed {
+					allDone = false
+					break
+				}
+			}
+			if allDone {
+				c.State = Reducing
+			}
+		}
+	case ReduceTask:
+		{
+			for i := range c.ReduceTasks {
+				if c.ReduceTasks[i].taskID == args.TaskID && c.ReduceTasks[i].Type == ReduceTask {
+					c.ReduceTasks[i].state = Completed
+					break
+				}
+			}
+			//检查是否所有reduce任务完成，若完成则进入alldone阶段
+			allDone := true
+			for i := range c.ReduceTasks {
+				if c.ReduceTasks[i].state != Completed {
+					allDone = false
+					break
+				}
+			}
+			if allDone {
+				c.State = AllDone
+			}
 		}
 	}
 	return nil
@@ -162,9 +168,34 @@ func (c *Coordinator) timeChecker() {
 	for {
 		time.Sleep(1 * time.Second)
 		c.Lock.Lock()
-		for _, task := range c.Tasks {
-			if task.state == InProgress && time.Since(task.StartTime) > 10*time.Second {
-				task.state = Idle
+		switch c.State {
+		case Mapping:
+			{
+				for i := range c.MapTasks {
+					if c.MapTasks[i].state == InProgress {
+						if time.Since(c.MapTasks[i].StartTime) > 10*time.Second {
+							//任务超时，重新分配
+							c.MapTasks[i].state = Idle
+						}
+					}
+				}
+			}
+		case Reducing:
+			{
+				for i := range c.ReduceTasks {
+					if c.ReduceTasks[i].state == InProgress {
+						if time.Since(c.ReduceTasks[i].StartTime) > 10*time.Second {
+							//任务超时，重新分配
+							c.ReduceTasks[i].state = Idle
+						}
+					}
+				}
+			}
+		case AllDone:
+			{
+				c.Lock.Unlock()
+
+				return
 			}
 		}
 		c.Lock.Unlock()
@@ -212,7 +243,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			taskID:   index,
 			Type:     MapTask,
 		}
-		c.Tasks = append(c.Tasks, task)
+		c.MapTasks = append(c.MapTasks, task)
+	}
+	for i := 0; i < nReduce; i++ {
+		task := Task{
+			state:  Idle,
+			taskID: i,
+			Type:   ReduceTask,
+		}
+		c.ReduceTasks = append(c.ReduceTasks, task)
 	}
 	c.Mapcount = len(files)
 	c.Lock = sync.Mutex{}

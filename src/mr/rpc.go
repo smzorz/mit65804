@@ -32,6 +32,7 @@ type RegisterReply struct {
 	TaskID   int
 	Type     TaskType
 	Mapcount int
+	Success  bool
 }
 
 type ReportArgs struct {

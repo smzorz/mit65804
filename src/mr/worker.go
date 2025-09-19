@@ -48,8 +48,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			fmt.Printf("register failed!\n")
 			break // coordinator exited
 		}
-		if reply.Filename == "" {
-			break // all done
+		if reply.Success == false {
+			time.Sleep(time.Second)
+			continue // no task available
 		}
 		switch reply.Type {
 		case MapTask:
@@ -108,7 +109,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				replyReport := ReportReply{}
 				ok = call("Coordinator.Report", &argsReport, &replyReport)
 				if ok {
-					fmt.Printf("report success %v\n", reply.Filename)
+					fmt.Printf("report map success %v\n", reply.Filename)
 				} else {
 					fmt.Printf("report failed!\n")
 				}
@@ -177,7 +178,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				replyReport := ReportReply{}
 				ok = call("Coordinator.Report", &argsReport, &replyReport)
 				if ok {
-					fmt.Printf("report success %v\n", oname)
+					fmt.Printf("report reduce success %v\n", oname)
 				} else {
 					fmt.Printf("report failed!\n")
 				}
