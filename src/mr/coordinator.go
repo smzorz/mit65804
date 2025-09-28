@@ -82,7 +82,6 @@ func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
 					reply.Mapcount = c.Mapcount
 					reply.Success = true
 					return nil
-
 				}
 
 			}
@@ -105,7 +104,6 @@ func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
 					reply.Mapcount = c.Mapcount
 					reply.Success = true
 					return nil
-
 				}
 
 			}
