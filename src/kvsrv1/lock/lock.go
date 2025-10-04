@@ -36,6 +36,7 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 
 func (lk *Lock) Acquire() {
 	// Your code here
+
 	for {
 		value, version, err := lk.ck.Get(lk.lock_name)
 		if err == rpc.ErrNoKey {
@@ -71,17 +72,29 @@ func (lk *Lock) Acquire() {
 
 func (lk *Lock) Release() {
 	for {
-		err := lk.ck.Put(lk.lock_name, "", rpc.Tversion(lk.version))
-		switch err {
-		case rpc.OK:
-			lk.version = 0
-			return
-		case rpc.ErrMaybe:
-			value, _, err := lk.ck.Get(lk.lock_name)
-			if err == rpc.OK && value == "" {
+		value, version, err := lk.ck.Get(lk.lock_name)
+		if err == rpc.OK && value == lk.id {
+			put_err := lk.ck.Put(lk.lock_name, "", version)
+			switch put_err {
+			case rpc.OK:
 				lk.version = 0
 				return
+			case rpc.ErrMaybe:
+				value, _, err := lk.ck.Get(lk.lock_name)
+				if err == rpc.OK && value == "" {
+					lk.version = 0
+					return
+				}
 			}
+		} else if err == rpc.ErrNoKey {
+			lk.version = 0
+			return
+		} else {
+			// either err != OK or value != lk.id
+			// means the lock is not held by this client
+			panic("lock not held by client")
+			return
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
