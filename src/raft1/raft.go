@@ -9,12 +9,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -93,6 +95,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -113,6 +122,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []Log
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		//error
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -161,6 +184,13 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	//3c
+	//ConflictIndex int
+	//ConflictTerm  int
+	XTerm  int
+	XIndex int
+	XLen   int
 }
 
 // example RequestVote RPC handler.
@@ -171,6 +201,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		rf.persist()
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -185,11 +216,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			reply.Term = rf.currentTerm
 			rf.electTimeDeadline = time.Now().Add(time.Duration(300+(rand.Int63()%50)) * time.Millisecond)
+			rf.persist()
 			return
 		}
 	}
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
+	rf.persist()
 	return
 }
 
@@ -232,10 +265,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = Follower
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+
 		return
 	}
 	// reset election timeout on any AppendEntries from current leader
@@ -245,6 +280,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if (args.PrevLogIndex > len(rf.logs)-1) || (args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		if args.PrevLogIndex > len(rf.logs)-1 {
+			reply.XLen = len(rf.logs)
+			reply.XTerm = -1
+			reply.XIndex = -1
+		} else {
+			reply.XLen = -1
+			reply.XTerm = rf.logs[args.PrevLogIndex].Term
+			//find first index of XTerm
+			xIndex := args.PrevLogIndex
+			for xIndex-1 >= 0 && rf.logs[xIndex-1].Term == reply.XTerm {
+				xIndex -= 1
+			}
+			reply.XIndex = xIndex
+		}
+		rf.persist()
 		return
 	}
 	// If there are entries, append them (handling conflicts). If heartbeat (no entries), skip.
@@ -258,11 +308,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					if rf.commitIndex >= args.PrevLogIndex+1+i {
 						rf.commitIndex = args.PrevLogIndex + 1 + i - 1
 					}
-
+					rf.persist()
 					break
 				}
 			} else {
 				rf.logs = append(rf.logs, args.Entries[i:]...)
+				rf.persist()
 				break
 			}
 		}
@@ -275,6 +326,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 	}
+	rf.persist()
 	reply.Term = rf.currentTerm
 	reply.Success = true
 	return
@@ -314,6 +366,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logs = append(rf.logs, newLog)
 	index = len(rf.logs) - 1
 	term = rf.currentTerm
+	rf.persist()
 	rf.mu.Unlock()
 	go rf.runAppendEntries()
 	return index, term, isLeader
@@ -350,6 +403,7 @@ func (rf *Raft) ticker() {
 			rf.state = Candidate
 			rf.currentTerm += 1
 			rf.votedFor = rf.me
+			rf.persist()
 			rf.electTimeDeadline = time.Now().Add(time.Duration(300+(rand.Int63()%50)) * time.Millisecond)
 			// initialize vote count
 			// send RequestVote RPCs to all other servers
@@ -421,6 +475,7 @@ func (rf *Raft) runElection(args *RequestVoteArgs) {
 					rf.nextIndex[i] = len(rf.logs)
 					rf.matchIndex[i] = 0
 				}
+				rf.persist()
 				rf.heartTimeDeadline = time.Now().Add(100 * time.Millisecond)
 				rf.mu.Unlock()
 				go rf.runAppendEntries()
@@ -541,10 +596,21 @@ func (rf *Raft) runAppendEntries() {
 						}
 						rf.mu.Unlock()
 					} else {
-
-						if rf.nextIndex[server] > 1 {
-							rf.nextIndex[server] -= 1
+						lastIndexWithTerm := -1
+						for i := len(rf.logs) - 1; i >= 0; i-- {
+							if rf.logs[i].Term == reply.XTerm {
+								lastIndexWithTerm = i
+								break
+							}
+						}
+						if reply.XTerm == -1 {
+							rf.nextIndex[server] = reply.XLen
+						} else if lastIndexWithTerm != -1 {
+							rf.nextIndex[server] = lastIndexWithTerm + 1
 						} else {
+							rf.nextIndex[server] = reply.XIndex
+						}
+						if rf.nextIndex[server] < 1 {
 							rf.nextIndex[server] = 1
 						}
 						rf.mu.Unlock()
@@ -596,6 +662,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	//dummy log at index 0
@@ -603,12 +670,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs[0] = Log{Command: nil, Term: 0}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.readPersist(persister.ReadRaftState())
 	rf.heartTimeDeadline = time.Now().Add(100 * time.Millisecond)
 	ms := 300 + (rand.Int63() % 50)
 	rf.electTimeDeadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
 	rf.state = Follower
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+
 	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// start applier goroutine to apply committed log entries to state machine
