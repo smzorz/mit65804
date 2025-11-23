@@ -1,0 +1,10 @@
+Test (3D): snapshots basic (reliable network)...
+  ... Passed --  time  2.1s #peers 3 #RPCs   436 #Ops    0
+Test (3D): install snapshots (disconnect) (reliable network)...
+Fatal: one(6453110619797327390) failed to reach agreement
+        /home/smz/project/65840/6.5840/src/raft1/test.go:283
+        /home/smz/project/65840/6.5840/src/raft1/raft_test.go:1285
+        /home/smz/project/65840/6.5840/src/raft1/raft_test.go:1302
+info: wrote visualization to /tmp/porcupine-1400647453.html
+--- FAIL: TestSnapshotInstall3D (12.40s)
+Test (3D): install snapshots (disconnect) (unreliable network)...
