@@ -66,6 +66,11 @@ const (
 	Leader    State = 2
 )
 
+func (rf *Raft) safeSend(msg raftapi.ApplyMsg) {
+	defer func() { recover() }()
+	rf.applyCh <- msg
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -453,7 +458,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.applyCond.Broadcast()
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
@@ -844,7 +853,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 		// Temporarily unlock to send snapshot to avoid blocking while holding lock
 		rf.mu.Unlock()
-		rf.applyCh <- applymsg
+		rf.safeSend(applymsg)
 		rf.mu.Lock()
 
 		if rf.lastApplied < args.LastIncludedIndex {
@@ -861,6 +870,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Unlock()
 }
 func (rf *Raft) applier(applyCh chan raftapi.ApplyMsg) {
+	defer close(applyCh)
 	for !rf.killed() {
 		rf.mu.Lock()
 		for rf.commitIndex <= rf.lastApplied {
