@@ -19,17 +19,22 @@ const (
 type Tversion uint64
 
 type PutArgs struct {
-	Key     string
-	Value   string
-	Version Tversion
+	Key      string
+	Value    string
+	Version  Tversion
+	SeqNum   int64
+	ClientId int64
 }
 
 type PutReply struct {
-	Err Err
+	Err     Err
+	Version Tversion
 }
 
 type GetArgs struct {
-	Key string
+	Key      string
+	SeqNum   int64
+	ClientId int64
 }
 
 type GetReply struct {
@@ -37,4 +42,3 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
-
