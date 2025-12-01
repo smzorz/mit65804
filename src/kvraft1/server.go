@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
 
@@ -11,6 +13,15 @@ import (
 	tester "6.5840/tester1"
 )
 
+const kvDebug = false
+
+func kvLog(kv *KVServer, format string, a ...interface{}) {
+	if !kvDebug {
+		return
+	}
+	log.Printf("[S%d] "+format, append([]interface{}{kv.me}, a...)...)
+}
+
 type KVServer struct {
 	me   int
 	dead int32 // set by Kill()
@@ -18,15 +29,15 @@ type KVServer struct {
 
 	// Your definitions here.
 	db map[string]struct {
-		value   string
-		version rpc.Tversion
+		Value   string
+		Version rpc.Tversion
 	}
 	mu          sync.Mutex
-	lastApplied map[int64]LastOpInfo // map from ClientId to last applied SeqNum
+	lastApplied map[int64]LastOpInfo
 }
 type LastOpInfo struct {
-	LastSeqNum int64
-	Reply      CommandResult
+	SeqNum int64
+	Reply  CommandResult
 }
 type Op struct {
 	Type     string
@@ -51,60 +62,93 @@ func (kv *KVServer) DoOp(req any) any {
 	op := req.(Op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if lastInfo, ok := kv.lastApplied[op.ClientId]; ok {
+	kvLog(kv, "DoOp: %+v", op)
 
-		if op.SeqNum <= lastInfo.LastSeqNum {
-			// Duplicate request
-			return lastInfo.Reply
+	if last, ok := kv.lastApplied[op.ClientId]; ok {
+		if op.SeqNum <= last.SeqNum {
+			kvLog(kv, "DoOp: duplicate/stale request detected: %+v", op)
+			return last.Reply
 		}
 	}
+
 	var result CommandResult
 	result.Err = rpc.OK
+
+	// 2. 执行逻辑 (保持不变)
 	switch op.Type {
 	case "Get":
 		if v, ok := kv.db[op.Key]; ok {
-			result.Value = v.value
+			result.Value = v.Value
 			result.Err = rpc.OK
-			result.Version = v.version
+			result.Version = v.Version
 		} else {
 			result.Err = rpc.ErrNoKey
 		}
 	case "Put":
-		var oldVersion rpc.Tversion = 0
+		var currentVersion rpc.Tversion = 0
 		if v, ok := kv.db[op.Key]; ok {
-			oldVersion = v.version
-			if oldVersion != op.Version {
-				result.Err = rpc.ErrVersion
-				result.Version = oldVersion
-				break
-			}
+			currentVersion = v.Version
 		}
-		kv.db[op.Key] = struct {
-			value   string
-			version rpc.Tversion
-		}{value: op.Value, version: oldVersion + 1}
 
+		if op.Version != currentVersion {
+			result.Err = rpc.ErrVersion
+			result.Version = currentVersion
+			break // 拒绝写入
+		}
+
+		kv.db[op.Key] = struct {
+			Value   string
+			Version rpc.Tversion
+		}{Value: op.Value, Version: currentVersion + 1}
+
+		result.Err = rpc.OK
+		result.Version = currentVersion + 1
 	default:
 		// unknown command
 	}
-	kv.lastApplied[op.ClientId] = LastOpInfo{
-		LastSeqNum: op.SeqNum,
-		Reply:      result,
-	}
 
+	kv.lastApplied[op.ClientId] = LastOpInfo{SeqNum: op.SeqNum, Reply: result}
+
+	kvLog(kv, "DoOp: result: %+v", result)
 	return result
-
-	// Check for duplicate requests
-
 }
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	e.Encode(kv.db)
+	e.Encode(kv.lastApplied)
+
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	if len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var db map[string]struct {
+		Value   string
+		Version rpc.Tversion
+	}
+	var lastApplied map[int64]LastOpInfo
+	if d.Decode(&db) != nil ||
+		d.Decode(&lastApplied) != nil {
+		panic("couldn't decode data")
+	}
+	kv.mu.Lock()
+	kv.db = db
+	kv.lastApplied = lastApplied
+	if kv.lastApplied == nil {
+		kv.lastApplied = make(map[int64]LastOpInfo)
+	}
+	kv.mu.Unlock()
+
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -182,8 +226,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(Op{})
 	kv := &KVServer{me: me}
 	kv.db = make(map[string]struct {
-		value   string
-		version rpc.Tversion
+		Value   string
+		Version rpc.Tversion
 	})
 	kv.mu = sync.Mutex{}
 	kv.lastApplied = make(map[int64]LastOpInfo)

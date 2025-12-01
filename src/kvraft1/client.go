@@ -1,14 +1,24 @@
 package kvraft
 
 import (
-	"crypto/rand"
+	crand "crypto/rand"
+	"log"
 	"math/big"
+	"math/rand"
 	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
 )
+
+const ckDebug = false
+
+func ckLog(format string, a ...interface{}) {
+	if ckDebug {
+		log.Printf("[Clerk] "+format, a...)
+	}
+}
 
 type Clerk struct {
 	clnt    *tester.Clnt
@@ -21,7 +31,7 @@ type Clerk struct {
 
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
+	bigx, _ := crand.Int(crand.Reader, max)
 	return bigx.Int64()
 }
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
@@ -31,6 +41,16 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 	ck.seqNum = 0
 	ck.clientId = nrand()
 	return ck
+}
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+func (ck *Clerk) advanceLeader() {
+	ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+	backoff := 50*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond
+	time.Sleep(backoff)
 }
 
 // Get fetches the current value and version for a key.  It returns
@@ -46,16 +66,22 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	ck.seqNum++
 	for {
+
 		args := &rpc.GetArgs{Key: key, SeqNum: ck.seqNum, ClientId: ck.clientId}
+		ckLog("Client: %d Get: %+v", ck.clientId, args)
 		var reply rpc.GetReply
 		ok := ck.clnt.Call(ck.servers[ck.leaderId], "KVServer.Get", args, &reply)
 		if ok {
 			if reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey {
+				ckLog("Client: %d Get: reply: %+v", ck.clientId, reply)
 				return reply.Value, reply.Version, reply.Err
 			}
+			if reply.Err == rpc.ErrWrongLeader {
+				ck.advanceLeader()
+				continue
+			}
 		}
-		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-		time.Sleep(100 * time.Millisecond)
+		ck.advanceLeader()
 	}
 }
 
@@ -77,31 +103,41 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
 	ck.seqNum++
-
 	args := &rpc.PutArgs{Key: key, Value: value, Version: version, SeqNum: ck.seqNum, ClientId: ck.clientId}
+	var retried bool
+	retried = false
 	for {
+		ckLog("Put: %+v", args)
 		var reply rpc.PutReply
-
 		ok := ck.clnt.Call(ck.servers[ck.leaderId], "KVServer.Put", args, &reply)
-
 		if ok {
-			if reply.Err == rpc.OK {
+			ckLog("Put: reply: %+v", reply)
+			switch reply.Err {
+			case rpc.OK:
+				ckLog("Put: reply: %+v", reply)
 				return rpc.OK
-			}
-
-			if reply.Err == rpc.ErrNoKey {
-				return rpc.ErrNoKey
-			}
-			if reply.Err == rpc.ErrVersion {
+			case rpc.ErrVersion:
+				if retried {
+					return rpc.ErrMaybe
+				}
 				return rpc.ErrVersion
+			case rpc.ErrWrongLeader:
+				// rotate below
+			case rpc.ErrNoKey:
+				if retried {
+					return rpc.ErrMaybe
+				}
+				return rpc.ErrNoKey
+			default:
+				if retried {
+					return rpc.ErrMaybe
+				}
+				return reply.Err
 			}
-
+		} else {
+			retried = true
 		}
-		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-		time.Sleep(100 * time.Millisecond)
-
+		ck.advanceLeader()
 	}
-
 }

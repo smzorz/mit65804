@@ -55,8 +55,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	notifyChans map[int]chan OpResult // map from log index to notify channel
-	deadCh      chan struct{}
+	notifyChans    map[int]chan OpResult // map from log index to notify channel
+	pendingResults map[int]OpResult      // results produced before waiter registered
+	deadCh         chan struct{}
 }
 
 // servers[] contains the ports of the set of
@@ -76,14 +77,19 @@ type RSM struct {
 // any long-running work.
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
-		me:           me,
-		maxraftstate: maxraftstate,
-		applyCh:      make(chan raftapi.ApplyMsg),
-		sm:           sm,
-		notifyChans:  make(map[int]chan OpResult),
+		me:             me,
+		maxraftstate:   maxraftstate,
+		applyCh:        make(chan raftapi.ApplyMsg),
+		sm:             sm,
+		notifyChans:    make(map[int]chan OpResult),
+		pendingResults: make(map[int]OpResult),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
+	}
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
 	}
 	rsm.deadCh = make(chan struct{})
 	go rsm.Reader()
@@ -99,11 +105,23 @@ func (rsm *RSM) Reader() {
 			}
 			result := rsm.sm.DoOp(op.Command)
 			rsm.mu.Lock()
-			if ch, ok := rsm.notifyChans[msg.CommandIndex]; ok {
-				ch <- OpResult{Value: result, OpId: op.OpId, Term: 0}
+			if rsm.rf.PersistBytes() > rsm.maxraftstate && rsm.maxraftstate != -1 {
+				snapshot := rsm.sm.Snapshot()
+				rsm.rf.Snapshot(msg.CommandIndex, snapshot)
+
 			}
+			opResult := OpResult{Value: result, OpId: op.OpId, Term: 0}
+			if ch, ok := rsm.notifyChans[msg.CommandIndex]; ok {
+				rsm.mu.Unlock()
+				ch <- opResult
+				continue
+			}
+			rsm.pendingResults[msg.CommandIndex] = opResult
 			rsm.mu.Unlock()
+		} else if msg.SnapshotValid {
+			rsm.sm.Restore(msg.Snapshot)
 		}
+
 	}
 
 	rsm.mu.Lock()
@@ -139,7 +157,13 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	ch := make(chan OpResult, 1)
 	rsm.mu.Lock()
 	rsm.notifyChans[index] = ch
-	rsm.mu.Unlock()
+	if pending, ok := rsm.pendingResults[index]; ok {
+		delete(rsm.pendingResults, index)
+		rsm.mu.Unlock()
+		ch <- pending
+	} else {
+		rsm.mu.Unlock()
+	}
 	defer func() {
 		rsm.mu.Lock()
 		delete(rsm.notifyChans, index)
