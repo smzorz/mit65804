@@ -8,7 +8,7 @@ import (
 	"slices"
 	"testing"
 
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Tshid int
@@ -29,7 +29,7 @@ const (
 func Key2Shard(key string) Tshid {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	shard := Tshid(Tshid(h.Sum32()) % NShards)
+	shard := Tshid(Tshid(h.Sum32()) % +NShards)
 	return shard
 }
 

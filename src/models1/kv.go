@@ -1,9 +1,11 @@
 package models
 
-import "github.com/anishathalye/porcupine"
+import (
+	"fmt"
+	"sort"
 
-import "fmt"
-import "sort"
+	"github.com/anishathalye/porcupine"
+)
 
 type KvInput struct {
 	Op      uint8 // 0 => get, 1 => put
@@ -66,8 +68,11 @@ var KvModel = porcupine.Model{
 		}
 	},
 	DescribeOperation: func(input, output interface{}) string {
-		inp := input.(KvInput)
-		out := output.(KvOutput)
+		inp, okIn := input.(KvInput)
+		out, okOut := output.(KvOutput)
+		if !okIn || !okOut {
+			return "<nil>"
+		}
 		switch inp.Op {
 		case 0:
 			return fmt.Sprintf("get('%s') -> ('%s', '%d', '%s')", inp.Key, out.Value, out.Version, out.Err)
