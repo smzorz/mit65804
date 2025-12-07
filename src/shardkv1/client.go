@@ -60,6 +60,7 @@ func (ck *Clerk) refreshConfig() {
 	if cfg := ck.sck.Query(); cfg != nil {
 		if cfg.Num >= ck.config.Num {
 			ck.config = *cfg
+			upCkLog("refresh config %v", cfg)
 		}
 	}
 }

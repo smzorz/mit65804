@@ -213,38 +213,48 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 		Shard: s,
 		Num:   num,
 	}
-	retried := false
+	failedAttempts := 0
+	maxAttempts := len(ck.servers)
+	if maxAttempts == 0 {
+		return nil, rpc.ErrMaybe
+	}
 	for {
 		var reply shardrpc.FreezeShardReply
 		ckLog("FreezeShard: %+v", args)
 		ok, timedOut := ck.callWithTimeout(ck.servers[ck.leaderId], "KVServer.FreezeShard", args, &reply)
 		if timedOut {
-			if retried {
+			failedAttempts++
+			if failedAttempts >= maxAttempts {
 				return nil, rpc.ErrMaybe
 			}
-			retried = true
 			ck.advanceLeader()
 			continue
 		}
 		if ok {
+			failedAttempts = 0
 			ckLog("FreezeShard: reply: %+v", reply)
 			switch reply.Err {
 			case rpc.OK:
 				ckLog("FreezeShard: reply: %+v", reply)
 				return reply.State, rpc.OK
 			case rpc.ErrWrongLeader:
-				retried = true
 				ck.advanceLeader()
 				continue
 			case rpc.ErrWrongGroup:
 				return nil, rpc.ErrWrongGroup
 			default:
-				retried = true
+				failedAttempts++
+				if failedAttempts >= maxAttempts {
+					return nil, rpc.ErrMaybe
+				}
 				ck.advanceLeader()
 				continue
 			}
 		} else {
-			retried = true
+			failedAttempts++
+			if failedAttempts >= maxAttempts {
+				return nil, rpc.ErrMaybe
+			}
 			ck.advanceLeader()
 		}
 
@@ -259,38 +269,48 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 		State: state,
 		Num:   num,
 	}
-	retried := false
+	failedAttempts := 0
+	maxAttempts := len(ck.servers)
+	if maxAttempts == 0 {
+		return rpc.ErrMaybe
+	}
 	for {
 		var reply shardrpc.InstallShardReply
 		ckLog("InstallShard: %+v", args)
 		ok, timedOut := ck.callWithTimeout(ck.servers[ck.leaderId], "KVServer.InstallShard", args, &reply)
 		if timedOut {
-			if retried {
+			failedAttempts++
+			if failedAttempts >= maxAttempts {
 				return rpc.ErrMaybe
 			}
-			retried = true
 			ck.advanceLeader()
 			continue
 		}
 		if ok {
+			failedAttempts = 0
 			ckLog("InstallShard: reply: %+v", reply)
 			switch reply.Err {
 			case rpc.OK:
 				ckLog("InstallShard: reply: %+v", reply)
 				return rpc.OK
 			case rpc.ErrWrongLeader:
-				retried = true
 				ck.advanceLeader()
 				continue
 			case rpc.ErrWrongGroup:
 				return rpc.ErrWrongGroup
 			default:
-				retried = true
+				failedAttempts++
+				if failedAttempts >= maxAttempts {
+					return rpc.ErrMaybe
+				}
 				ck.advanceLeader()
 				continue
 			}
 		} else {
-			retried = true
+			failedAttempts++
+			if failedAttempts >= maxAttempts {
+				return rpc.ErrMaybe
+			}
 			ck.advanceLeader()
 		}
 
@@ -305,38 +325,48 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		Shard: s,
 		Num:   num,
 	}
-	retried := false
+	failedAttempts := 0
+	maxAttempts := len(ck.servers)
+	if maxAttempts == 0 {
+		return rpc.ErrMaybe
+	}
 	for {
 		var reply shardrpc.DeleteShardReply
 		ckLog("DeleteShard: %+v", args)
 		ok, timedOut := ck.callWithTimeout(ck.servers[ck.leaderId], "KVServer.DeleteShard", args, &reply)
 		if timedOut {
-			if retried {
+			failedAttempts++
+			if failedAttempts >= maxAttempts {
 				return rpc.ErrMaybe
 			}
-			retried = true
 			ck.advanceLeader()
 			continue
 		}
 		if ok {
+			failedAttempts = 0
 			ckLog("DeleteShard: reply: %+v", reply)
 			switch reply.Err {
 			case rpc.OK:
 				ckLog("DeleteShard: reply: %+v", reply)
 				return rpc.OK
 			case rpc.ErrWrongLeader:
-				retried = true
 				ck.advanceLeader()
 				continue
 			case rpc.ErrWrongGroup:
 				return rpc.ErrWrongGroup
 			default:
-				retried = true
+				failedAttempts++
+				if failedAttempts >= maxAttempts {
+					return rpc.ErrMaybe
+				}
 				ck.advanceLeader()
 				continue
 			}
 		} else {
-			retried = true
+			failedAttempts++
+			if failedAttempts >= maxAttempts {
+				return rpc.ErrMaybe
+			}
 			ck.advanceLeader()
 		}
 

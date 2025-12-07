@@ -68,7 +68,12 @@ type CommandResult struct {
 func (kv *KVServer) DoOp(req any) any {
 	op := req.(Op)
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			kv.mu.Unlock()
+		}
+	}()
 	kvLog(kv, "DoOp: %+v", op)
 	if op.Type == "Put" {
 		if shardHistory, ok := kv.lastApplied[op.Shard]; ok {
@@ -93,6 +98,7 @@ func (kv *KVServer) DoOp(req any) any {
 		}
 		// if we don't own the shard, or it's currently transferring (frozen), reject
 		if !kv.ownedShards[shard] || kv.transferringShards[shard] {
+			kvLog(kv, "own:%v, trasns:%v", kv.ownedShards[shard], kv.transferringShards[shard])
 			result.Err = rpc.ErrWrongGroup
 			break
 		}
@@ -148,20 +154,32 @@ func (kv *KVServer) DoOp(req any) any {
 		shard := op.Shard
 		num := op.Num
 
-		if op.Num < kv.shardVersions[op.Shard] {
-			result.Err = rpc.OK
-			break
-		}
-		if !kv.ownedShards[shard] {
-			if kv.shardVersions[shard] < num {
+		currentVersion := kv.shardVersions[shard]
+		skipFreeze := false
+		switch {
+		case num < currentVersion:
+			result.Err = rpc.ErrWrongGroup
+			skipFreeze = true
+		case num == currentVersion:
+			if !kv.ownedShards[shard] || kv.data[shard] == nil {
 				result.Err = rpc.ErrWrongGroup
+				skipFreeze = true
 				break
 			}
-
+			kv.transferringShards[shard] = true
+		case num > currentVersion:
+			if !kv.ownedShards[shard] {
+				result.Err = rpc.ErrWrongGroup
+				skipFreeze = true
+				break
+			}
+			kv.shardVersions[shard] = num
+			// mark transferring (frozen) but don't clear data yet; Delete will clean up
+			kv.transferringShards[shard] = true
 		}
-		kv.shardVersions[shard] = num
-		// mark transferring (frozen) but don't clear data yet; Delete will clean up
-		kv.transferringShards[shard] = true
+		if skipFreeze {
+			break
+		}
 
 		// 复制当前 shard 数据，减小持锁时间
 		dataMap := make(map[string]struct {
@@ -181,6 +199,7 @@ func (kv *KVServer) DoOp(req any) any {
 		}
 		kv.shardVersions[shard] = num
 		kvLog(kv, "FreezeShard: shard %d, num %d, current version %d myshards %v", shard, num, kv.shardVersions[shard], kv.ownedShards)
+		locked = false
 		kv.mu.Unlock()
 		w := new(bytes.Buffer)
 		e := labgob.NewEncoder(w)
@@ -188,16 +207,23 @@ func (kv *KVServer) DoOp(req any) any {
 		e.Encode(clientMap)
 		encodedState := w.Bytes()
 		kv.mu.Lock()
+		locked = true
 		result.State = encodedState
 		result.Num = num
 	case "InstallShard":
-		if op.Num <= kv.shardVersions[op.Shard] {
+		shard := op.Shard
+		currentVersion := kv.shardVersions[shard]
+		if op.Num <= currentVersion {
+			if kv.transferringShards[shard] {
+
+				kvLog(kv, "Thaw shard %d via Install rollback: current version %d", shard, currentVersion)
+			}
 			result.Err = rpc.OK
+			result.Num = currentVersion
 			break
 		}
 
-		kv.shardVersions[op.Shard] = op.Num
-		shard := op.Shard
+		locked = false
 		kv.mu.Unlock()
 		r := bytes.NewBuffer(op.State)
 		d := labgob.NewDecoder(r)
@@ -211,8 +237,9 @@ func (kv *KVServer) DoOp(req any) any {
 			panic("couldn't decode shard state")
 		}
 		kv.mu.Lock()
+		locked = true
+		kv.shardVersions[shard] = op.Num
 		kv.ownedShards[shard] = true
-		// installing a shard: take ownership here and clear transferring flag
 		kv.transferringShards[shard] = false
 		kv.data[shard] = make(map[string]struct {
 			Value   string
@@ -229,8 +256,8 @@ func (kv *KVServer) DoOp(req any) any {
 				kv.lastApplied[shard][cid] = v
 			}
 		}
-		kvLog(kv, "InstallShard: shard %d, num %d, current version %d,myshards %v", op.Shard, op.Num, kv.shardVersions[op.Shard], kv.ownedShards)
-		result.Num = op.Num
+		kvLog(kv, "InstallShard: shard %d, num %d, current version %d,myshards %v transferring %v", shard, op.Num, kv.shardVersions[shard], kv.ownedShards, kv.transferringShards[shard])
+		result.Num = kv.shardVersions[shard]
 		result.Err = rpc.OK
 	case "DeleteShard":
 		shard := op.Shard
@@ -243,10 +270,7 @@ func (kv *KVServer) DoOp(req any) any {
 		kv.shardVersions[shard] = num
 		kv.ownedShards[shard] = false
 		kv.transferringShards[shard] = false
-		kv.data[shard] = make(map[string]struct {
-			Value   string
-			Version rpc.Tversion
-		})
+		kv.data[shard] = nil
 		delete(kv.lastApplied, shard)
 		kvLog(kv, "DeleteShard: shard %d, num %d, current version %d,myshards %v transferring %v", shard, num, kv.shardVersions[shard], kv.ownedShards, kv.transferringShards[shard])
 		result.Num = num
@@ -403,8 +427,10 @@ func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.
 		Shard: args.Shard,
 		Num:   args.Num,
 	}
+	kvLog(kv, "start Freeze")
 	err, val := kv.rsm.Submit(op)
 	if err != rpc.OK {
+		kvLog(kv, "FreezeShard failed")
 		reply.Err = err
 		return
 	}
@@ -442,12 +468,15 @@ func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.
 		Shard: args.Shard,
 		Num:   args.Num,
 	}
+	kvLog(kv, "start Delete")
 	err, val_ := kv.rsm.Submit(op)
 	if err != rpc.OK {
 		reply.Err = err
+		kvLog(kv, "d fail %v", err)
 		return
 	}
 	result := val_.(CommandResult)
+	kvLog(kv, "Delete complete %v", result)
 	reply.Err = result.Err
 }
 

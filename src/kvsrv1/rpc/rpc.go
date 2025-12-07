@@ -14,6 +14,8 @@ const (
 	// For future kvraft lab
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrWrongGroup  = "ErrWrongGroup"
+
+	ErrValue = "ErrValue"
 )
 
 type Tversion uint64

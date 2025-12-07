@@ -71,6 +71,8 @@ func (cfg *ShardConfig) Copy() *ShardConfig {
 	for k, srvs := range cfg.Groups {
 		s := make([]string, len(srvs))
 		copy(s, srvs)
+		// sort server lists to make copies deterministic
+		slices.Sort(s)
 		c.Groups[k] = s
 	}
 	return c
@@ -154,51 +156,78 @@ func (c *ShardConfig) Rebalance() {
 }
 
 func (cfg *ShardConfig) Join(servers map[tester.Tgid][]string) bool {
-	changed := false
-	for gid, servers := range servers {
-		_, ok := cfg.Groups[gid]
-		if ok {
+	if len(servers) == 0 {
+		log.Fatalf("Join but no change")
+	}
+
+	// sort gids to make iteration deterministic
+	gids := make([]tester.Tgid, 0, len(servers))
+	for gid := range servers {
+		gids = append(gids, gid)
+	}
+	slices.Sort(gids)
+
+	// track all known servers to detect duplicates (existing + new)
+	used := make(map[string]tester.Tgid)
+	for gid, xservers := range cfg.Groups {
+		for _, s := range xservers {
+			used[s] = gid
+		}
+	}
+
+	// validate first (no partial application)
+	for _, gid := range gids {
+		if _, ok := cfg.Groups[gid]; ok {
 			log.Printf("re-Join %v", gid)
 			return false
 		}
-		for xgid, xservers := range cfg.Groups {
-			for _, s1 := range xservers {
-				for _, s2 := range servers {
-					if s1 == s2 {
-						log.Fatalf("Join(%v) puts server %v in groups %v and %v", gid, s1, xgid, gid)
-					}
-				}
+		for _, s := range servers[gid] {
+			if xgid, ok := used[s]; ok {
+				log.Fatalf("Join(%v) puts server %v in groups %v and %v", gid, s, xgid, gid)
 			}
+			used[s] = gid
 		}
-		// new GID
-		// modify cfg to reflect the Join()
-		cfg.Groups[gid] = servers
-		changed = true
 	}
-	if changed == false {
-		log.Fatalf("Join but no change")
+
+	// apply deterministically (sorted gids, sorted server lists)
+	for _, gid := range gids {
+		newSrvs := append([]string(nil), servers[gid]...)
+		slices.Sort(newSrvs)
+		cfg.Groups[gid] = newSrvs
 	}
+
 	cfg.Num += 1
 	return true
 }
 
 func (cfg *ShardConfig) Leave(gids []tester.Tgid) bool {
-	changed := false
+	if len(gids) == 0 {
+		debug.PrintStack()
+		log.Fatalf("Leave but no change")
+	}
+
+	// pre-validate: ensure all gids exist before mutating state
 	for _, gid := range gids {
-		_, ok := cfg.Groups[gid]
-		if ok == false {
+		if _, ok := cfg.Groups[gid]; !ok {
 			// already no GID!
 			log.Printf("Leave(%v) but not in config", gid)
 			return false
-		} else {
-			// modify op.Config to reflect the Leave()
-			delete(cfg.Groups, gid)
-			changed = true
 		}
 	}
-	if changed == false {
-		debug.PrintStack()
-		log.Fatalf("Leave but no change")
+
+	// apply deterministically: sort gids then delete
+	dedup := make(map[tester.Tgid]struct{})
+	sorted := make([]tester.Tgid, 0, len(gids))
+	for _, gid := range gids {
+		if _, seen := dedup[gid]; seen {
+			continue
+		}
+		dedup[gid] = struct{}{}
+		sorted = append(sorted, gid)
+	}
+	slices.Sort(sorted)
+	for _, gid := range sorted {
+		delete(cfg.Groups, gid)
 	}
 	cfg.Num += 1
 	return true

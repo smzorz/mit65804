@@ -1,6 +1,7 @@
 package shardctrler
 
 import (
+	"fmt"
 	"log"
 	"time"
 
@@ -12,7 +13,9 @@ import (
 	tester "6.5840/tester1"
 )
 
-const ScDebug = false // 建议跑测试时设为 false 以减少日志干扰
+const (
+	ScDebug = false
+)
 
 func ScLog(format string, a ...interface{}) {
 	if !ScDebug {
@@ -24,7 +27,6 @@ func ScLog(format string, a ...interface{}) {
 type ShardCtrler struct {
 	clnt *tester.Clnt
 	kvtest.IKVClerk
-	killed int32
 }
 
 func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
@@ -38,7 +40,6 @@ func (sck *ShardCtrler) makeGroupClerk(servers []string) *shardgrp.Clerk {
 	return shardgrp.MakeClerk(sck.clnt, servers)
 }
 
-// InitController 保持你的逻辑基本不变，它是正确的
 func (sck *ShardCtrler) InitController() {
 	curVal, _, _ := sck.IKVClerk.Get("config")
 	var curCfg *shardcfg.ShardConfig
@@ -54,39 +55,49 @@ func (sck *ShardCtrler) InitController() {
 	}
 	nexCfg := shardcfg.FromString(nexVal)
 
-	// 只有当 Intent(Next) > Current 时才恢复
-	if nexCfg.Num > curCfg.Num {
+	if nexCfg.Num >= curCfg.Num {
 		ScLog("Recovering config change from %d to %d", curCfg.Num, nexCfg.Num)
 
-		// Phase 1: Move
 		var moved []shardcfg.Tshid
 		var ok bool
 		for {
-			moved, ok = sck.transferShardsNoDelete(curCfg, nexCfg)
+			var advanced bool
+			moved, ok, advanced = sck.transferShardsNoDelete(curCfg, nexCfg)
+			if advanced {
+				ScLog("InitController aborting recovery for config %d: observed newer config", nexCfg.Num)
+				sck.clearNewConfigIntent(nexCfg)
+				return
+			}
 			if ok {
 				break
 			}
 			sck.backoff()
 		}
 
-		// Phase 2: Commit
 		for {
 			putErr := sck.IKVClerk.Put("config", nexCfg.String(), rpc.Tversion(curCfg.Num))
 			if putErr == rpc.OK || putErr == rpc.ErrVersion {
+				// config is committed (either by us or someone else). Persist
+				// the committed config for debugging and clear the intent so
+				// future controllers don't keep retrying the same transition.
+				sck.saveConfigHistory(nexCfg)
+				sck.clearNewConfigIntent(nexCfg)
 				break
 			}
 			sck.backoff()
 		}
 
-		// Phase 3: Cleanup
 		for _, shard := range moved {
 			srcGid := curCfg.Shards[shard]
 			srcServers := curCfg.Groups[srcGid]
-			srcClerk := sck.makeGroupClerk(srcServers)
 			for {
+				if len(srcServers) == 0 {
+					ScLog("Recovery DeleteShard skip shard %d: no servers for gid %d", shard, srcGid)
+					break
+				}
+				srcClerk := sck.makeGroupClerk(srcServers)
 				if srcClerk == nil {
 					sck.backoff()
-					srcClerk = sck.makeGroupClerk(srcServers)
 					continue
 				}
 				err := srcClerk.DeleteShard(shard, curCfg.Num)
@@ -94,6 +105,15 @@ func (sck *ShardCtrler) InitController() {
 					break
 				}
 				ScLog("Recovery DeleteShard failed shard %d: %v", shard, err)
+				if err == rpc.ErrMaybe {
+					if cur := sck.currentConfig(); cur != nil {
+						ScLog("config:%v", cur)
+						if updated, ok := cur.Groups[srcGid]; ok {
+							srcServers = updated
+							ScLog("servers %v", srcServers)
+						}
+					}
+				}
 				sck.backoff()
 			}
 		}
@@ -120,44 +140,116 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			continue
 		}
 
-		// Phase 0: Write Intent (WAL)
-		if !sck.persistNextConfig(new) {
+		oldSnapshot := oldCfg.Copy()
+
+		// persistNextConfig now returns (ok, conflict). If there's an
+		// intent conflict (same Num but different content), abort
+		// this ChangeConfigTo attempt to avoid executing against a
+		// config that wasn't actually persisted by us.
+		ok, conflict := sck.persistNextConfig(new)
+		if conflict {
+			ScLog("ChangeConfigTo aborting num %d: intent conflict detected for newconfig", new.Num)
+			sck.clearNewConfigIntent(new)
+			return
+		}
+		if !ok {
 			sck.backoff()
 			continue
 		}
 
-		// Phase 1: Move
-		moved, ok := sck.transferShardsNoDelete(oldCfg, new)
+		moved, ok, advanced := sck.transferShardsNoDelete(oldCfg, new)
+		if advanced {
+			ScLog("ChangeConfigTo aborting num %d: observed newer config", new.Num)
+			sck.clearNewConfigIntent(new)
+			return
+		}
 		if !ok {
 			ScLog("transferShardsNoDelete failed, retrying...")
 			sck.backoff()
 			continue
 		}
-		ScLog("transferShardsNoDelete succeeded, moved %d shards", len(moved))
+		ScLog("transferShardsNoDelete succeeded, moved %d shards,olgcfg: %v,newcfg:%v", len(moved), oldCfg, new)
 
-		// Phase 2: Commit
-		putErr := sck.IKVClerk.Put("config", new.String(), rpc.Tversion(oldCfg.Num))
-		ScLog("Phase 2 commit: putErr=%v, oldNum=%d, newNum=%d", putErr, oldCfg.Num, new.Num)
+	commitLoop:
+		for {
+			putErr := sck.IKVClerk.Put("config", new.String(), rpc.Tversion(oldCfg.Num))
+			ScLog("Phase 2 commit: putErr=%v, oldNum=%d, newNum=%d", putErr, oldCfg.Num, new.Num)
 
-		if putErr == rpc.OK {
-			// Clear the intent log after successful commit
-			sck.IKVClerk.Put("newconfig", "", 0)
-			ScLog("Config committed successfully, cleared newconfig")
+			switch putErr {
+			case rpc.OK:
+				// Persist the committed config for debugging before clearing intent
+				sck.saveConfigHistory(new)
+				sck.clearNewConfigIntent(new)
+				ScLog("Config committed successfully, cleared newconfig")
+				go sck.cleanupTransferredShards(oldSnapshot, moved)
+				ScLog("ChangeConfigTo returning after committing num %d", new.Num)
+				return
 
-			// Phase 3 cleanup happens asynchronously so we don't block config change completion.
-			oldSnapshot := oldCfg.Copy()
-			go sck.cleanupTransferredShards(oldSnapshot, moved)
-			ScLog("ChangeConfigTo returning after committing num %d", new.Num)
-			return
-		}
-		if putErr != rpc.ErrVersion {
-			ScLog("Put failed: %v", putErr)
-			sck.backoff()
+			case rpc.ErrMaybe:
+				cur := sck.currentConfig()
+				if cur != nil && cur.Num >= new.Num {
+					// Another controller likely committed; persist observed committed config
+					sck.saveConfigHistory(cur)
+					sck.clearNewConfigIntent(new)
+					ScLog("Config likely committed (ErrMaybe, cur=%d), issuing cleanup", cur.Num)
+					go sck.cleanupTransferredShards(oldSnapshot, moved)
+					return
+				}
+				sck.backoff()
+				continue commitLoop
+
+			case rpc.ErrVersion:
+				cur := sck.currentConfig()
+				if cur != nil && cur.Num >= new.Num {
+					// Observed newer committed config; persist for debugging
+					sck.saveConfigHistory(cur)
+					sck.clearNewConfigIntent(new)
+					ScLog("Config observed advanced to %d, issuing cleanup", cur.Num)
+					go sck.cleanupTransferredShards(oldSnapshot, moved)
+					return
+				}
+				break commitLoop
+
+			default:
+				ScLog("Put failed: %v", putErr)
+				sck.backoff()
+			}
 		}
 	}
 }
 
-func (sck *ShardCtrler) persistNextConfig(next *shardcfg.ShardConfig) bool {
+func (sck *ShardCtrler) clearNewConfigIntent(justCommitted *shardcfg.ShardConfig) {
+	for {
+		val, ver, err := sck.IKVClerk.Get("newconfig")
+		if err != rpc.OK && err != rpc.ErrNoKey {
+			sck.backoff()
+			continue
+		}
+
+		if val == "" || err == rpc.ErrNoKey {
+			return
+		}
+
+		existing := shardcfg.FromString(val)
+		if existing.Num != justCommitted.Num {
+			ScLog("Skipping cleanup: newconfig has changed (num %d != %d)", existing.Num, justCommitted.Num)
+			return
+		}
+
+		err = sck.IKVClerk.Put("newconfig", "", ver)
+		if err == rpc.OK {
+			return
+		}
+
+		if err == rpc.ErrVersion {
+			continue
+		}
+		sck.backoff()
+	}
+}
+
+func (sck *ShardCtrler) persistNextConfig(next *shardcfg.ShardConfig) (bool, bool) {
+	// returns (ok, conflict)
 	for {
 		val, ver, err := sck.IKVClerk.Get("newconfig")
 		if err != rpc.OK && err != rpc.ErrNoKey {
@@ -170,11 +262,17 @@ func (sck *ShardCtrler) persistNextConfig(next *shardcfg.ShardConfig) bool {
 		if err == rpc.ErrNoKey {
 			putErr = sck.IKVClerk.Put("newconfig", next.String(), 0)
 		} else {
-
 			if val != "" {
 				existing := shardcfg.FromString(val)
 				if existing.Num == next.Num {
-					return true
+					// If the existing intent has same Num, ensure the content
+					// matches exactly. If not, this is an intent conflict and
+					// we must not proceed with our migration.
+					if existing.String() == next.String() {
+						return true, false
+					}
+					ScLog("persistNextConfig: intent conflict for Num %d: existing=%v next=%v", next.Num, existing, next)
+					return false, true
 				}
 			}
 
@@ -183,8 +281,7 @@ func (sck *ShardCtrler) persistNextConfig(next *shardcfg.ShardConfig) bool {
 
 		switch putErr {
 		case rpc.OK:
-			return true
-		// ErrVersion 意味着并发写入，循环重试
+			return true, false
 		case rpc.ErrVersion, rpc.ErrMaybe:
 			sck.backoff()
 			continue
@@ -194,7 +291,7 @@ func (sck *ShardCtrler) persistNextConfig(next *shardcfg.ShardConfig) bool {
 	}
 }
 
-func (sck *ShardCtrler) transferShardsNoDelete(oldCfg, newCfg *shardcfg.ShardConfig) ([]shardcfg.Tshid, bool) {
+func (sck *ShardCtrler) transferShardsNoDelete(oldCfg, newCfg *shardcfg.ShardConfig) ([]shardcfg.Tshid, bool, bool) {
 
 	srcClerks := make(map[tester.Tgid]*shardgrp.Clerk)
 	dstClerks := make(map[tester.Tgid]*shardgrp.Clerk)
@@ -208,40 +305,59 @@ func (sck *ShardCtrler) transferShardsNoDelete(oldCfg, newCfg *shardcfg.ShardCon
 	}
 
 	moved := make([]shardcfg.Tshid, 0)
+
+	abortDueToAdvanced := func(format string, a ...interface{}) ([]shardcfg.Tshid, bool, bool) {
+		ScLog(format, a...)
+		return nil, false, true
+	}
+
 	for shard := shardcfg.Tshid(0); shard < shardcfg.NShards; shard++ {
 		srcGid := oldCfg.Shards[shard]
 		dstGid := newCfg.Shards[shard]
+		// Diagnostic: log mapping decisions for each shard so we can
+		// see why Freeze/Install is attempted for a shard that appears
+		// unchanged between configs.
+		ScLog("transferShardsNoDelete: shard %d oldNum=%d newNum=%d srcGid=%d dstGid=%d", shard, oldCfg.Num, newCfg.Num, srcGid, dstGid)
 		if srcGid == dstGid || dstGid == 0 || srcGid == 0 {
 			continue
 		}
 		srcServers, ok := oldCfg.Groups[srcGid]
-		if !ok {
-			ScLog("transferShardsNoDelete: missing srcGid %d", srcGid)
-			return nil, false
+		if !ok || len(srcServers) == 0 {
+			ScLog("transferShardsNoDelete: missing/empty srcGid %d", srcGid)
+			return nil, false, false
 		}
 		dstServers, ok := newCfg.Groups[dstGid]
-		if !ok {
-			ScLog("transferShardsNoDelete: missing dstGid %d", dstGid)
-			return nil, false
+		if !ok || len(dstServers) == 0 {
+			ScLog("transferShardsNoDelete: missing/empty dstGid %d", dstGid)
+			return nil, false, false
 		}
 
 		var state []byte
 		skipShard := false
 		srcClerk := getClerk(srcClerks, srcGid, srcServers)
+	freezeLoop:
 		for {
+			if sck.configAdvancedSince(oldCfg.Num) {
+				return abortDueToAdvanced("Aborting FreezeShard for shard %d: observed newer config", shard)
+			}
 			ScLog("FreezeShard: shard %d, num %d from gid %d", shard, oldCfg.Num, srcGid)
 			st, err := srcClerk.FreezeShard(shard, oldCfg.Num)
-			if err == rpc.OK {
+			switch err {
+			case rpc.OK:
 				state = st
-				break
-			}
-			if err == rpc.ErrWrongGroup {
+				break freezeLoop
+			case rpc.ErrWrongGroup:
 				ScLog("FreezeShard: ErrWrongGroup for shard %d (already moved)", shard)
 				skipShard = true
-				break
+				break freezeLoop
+			default:
+				ScLog("FreezeShard retry shard %d err=%v", shard, err)
+				if sck.configAdvancedSince(oldCfg.Num) {
+					return abortDueToAdvanced("Observed newer config during FreezeShard retry for shard %d", shard)
+				}
+				sck.backoff()
+				continue freezeLoop
 			}
-			ScLog("FreezeShard retry shard %d err=%v", shard, err)
-			sck.backoff()
 		}
 
 		if skipShard {
@@ -249,30 +365,44 @@ func (sck *ShardCtrler) transferShardsNoDelete(oldCfg, newCfg *shardcfg.ShardCon
 		}
 
 		dstClerk := getClerk(dstClerks, dstGid, dstServers)
+	installLoop:
 		for {
+			if sck.configAdvancedSince(oldCfg.Num) {
+				return abortDueToAdvanced("Aborting InstallShard for shard %d: observed newer config", shard)
+			}
 			ScLog("InstallShard: shard %d, num %d to gid %d", shard, newCfg.Num, dstGid)
 			err := dstClerk.InstallShard(shard, state, newCfg.Num)
-			if err == rpc.OK {
-				break
-			}
-			if err == rpc.ErrWrongGroup {
+			switch err {
+			case rpc.OK:
+				break installLoop
+			case rpc.ErrWrongGroup:
 				ScLog("InstallShard: ErrWrongGroup for shard %d (already installed)", shard)
-				break
+				break installLoop
+			default:
+				ScLog("InstallShard retry shard %d err=%v", shard, err)
+				if sck.configAdvancedSince(oldCfg.Num) {
+					return abortDueToAdvanced("Observed newer config during InstallShard retry for shard %d", shard)
+				}
+				sck.backoff()
+				continue installLoop
 			}
-			ScLog("InstallShard retry shard %d err=%v", shard, err)
-			sck.backoff()
 		}
 		moved = append(moved, shard)
 	}
-	return moved, true
+
+	return moved, true, false
 }
 
-// cleanupTransferredShards best-effort deletes frozen shards from the old groups.
 func (sck *ShardCtrler) cleanupTransferredShards(oldCfg *shardcfg.ShardConfig, moved []shardcfg.Tshid) {
 	for _, shard := range moved {
 		srcGid := oldCfg.Shards[shard]
 		srcServers := oldCfg.Groups[srcGid]
+		retryCount := 0
 		for {
+			if len(srcServers) == 0 {
+				ScLog("DeleteShard skip shard %d: no servers for gid %d", shard, srcGid)
+				break
+			}
 			srcClerk := sck.makeGroupClerk(srcServers)
 			if srcClerk == nil {
 				sck.backoff()
@@ -283,9 +413,46 @@ func (sck *ShardCtrler) cleanupTransferredShards(oldCfg *shardcfg.ShardConfig, m
 				break
 			}
 			ScLog("DeleteShard rpc failed for shard %d: %v", shard, err)
+			if err == rpc.ErrMaybe {
+				if cur := sck.currentConfig(); cur != nil {
+					if updated, ok := cur.Groups[srcGid]; ok {
+						srcServers = updated
+					}
+				}
+			}
+
+			retryCount++
+			if retryCount > 20 {
+				ScLog("DeleteShard giving up after %d attempts for shard %d: last err=%v", retryCount, shard, err)
+				break
+			}
 			sck.backoff()
 		}
 	}
+}
+
+// saveConfigHistory persists a copy of the provided config under the key
+// `cfghist-<num>` in the backing IKV store to make historical configs easy
+// to inspect for debugging.
+func (sck *ShardCtrler) saveConfigHistory(cfg *shardcfg.ShardConfig) {
+	if cfg == nil {
+		return
+	}
+	key := fmt.Sprintf("cfghist-%d", cfg.Num)
+	err := sck.IKVClerk.Put(key, cfg.String(), 0)
+	if err != rpc.OK {
+		ScLog("saveConfigHistory: Put returned %v for key %s", err, key)
+	} else {
+		ScLog("saveConfigHistory: saved config %d -> %s", cfg.Num, key)
+	}
+}
+
+func (sck *ShardCtrler) configAdvancedSince(oldNum shardcfg.Tnum) bool {
+	cur := sck.currentConfig()
+	if cur == nil {
+		return false
+	}
+	return cur.Num > oldNum
 }
 
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
